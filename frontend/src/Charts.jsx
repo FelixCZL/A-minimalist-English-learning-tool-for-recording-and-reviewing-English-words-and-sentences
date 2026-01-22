@@ -1,11 +1,15 @@
 import { useEffect, useRef } from 'react'
 import { createChart } from 'lightweight-charts'
 
-function Charts() {
+function Charts({ username, onLogout }) {
   const chartContainerRef = useRef()
 
   useEffect(() => {
     if (!chartContainerRef.current) return
+
+    console.log('Creating chart in container:', chartContainerRef.current)
+    console.log('Container width:', chartContainerRef.current?.clientWidth)
+    console.log('Container height:', chartContainerRef.current?.clientHeight)
 
     const chart = createChart(chartContainerRef.current, {
       layout: {
@@ -13,16 +17,14 @@ function Charts() {
         textColor: '#333',
       },
       grid: {
-        vertLines: {
-          color: '#e0e0e0',
-        },
-        horzLines: {
-          color: '#e0e0e0',
-        },
+        vertLines: { color: '#e0e0e0' },
+        horzLines: { color: '#e0e0e0' },
       },
-      width: chartContainerRef.current.clientWidth,
+      width: chartContainerRef.current.clientWidth || 800,
       height: 400,
     })
+
+    console.log('Chart created successfully')
 
     const candlestickSeries = chart.addCandlestickSeries({
       upColor: '#26a69a',
@@ -46,10 +48,11 @@ function Charts() {
     ]
 
     candlestickSeries.setData(data)
+    console.log('Data set successfully')
 
     const handleResize = () => {
       if (chartContainerRef.current) {
-        chart.applyOptions({ width: chartContainerRef.current.clientWidth })
+        chart.applyOptions({ width: chartContainerRef.current.clientWidth || 800 })
       }
     }
 
@@ -70,9 +73,15 @@ function Charts() {
         </p>
       </div>
 
-      <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
-        <div ref={chartContainerRef} />
-      </div>
+       <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
+         <div 
+           ref={chartContainerRef} 
+           style={{ 
+             minHeight: '400px', 
+             width: '100%' 
+           }} 
+         />
+       </div>
 
       <div className="mt-6 p-4 bg-blue-50 rounded-lg border border-blue-200">
         <h3 className="font-semibold text-blue-800 mb-2">ℹ️ 功能说明</h3>
