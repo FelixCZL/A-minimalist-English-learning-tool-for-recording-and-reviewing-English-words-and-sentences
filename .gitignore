@@ -42,6 +42,7 @@ env/
 *.db
 *.sqlite
 *.sqlite3
+device_id.txt
 
 # Vector database
 vector_db/

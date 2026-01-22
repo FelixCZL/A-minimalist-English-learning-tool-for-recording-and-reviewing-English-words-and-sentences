@@ -1,9 +1,14 @@
 import { useState, useEffect } from 'react'
+import { BrowserRouter as Router, Routes, Route, Link, useNavigate } from 'react-router-dom'
 import axios from 'axios'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+const DEVICE_ID_KEY = 'english_study_device_id'
+const LAST_SYNC_KEY = 'english_study_last_sync'
+const LOCAL_DATA_KEY = 'english_study_local_data'
+const TOKEN_KEY = 'english_study_token'
 
-function App() {
+function EnglishStudyApp({ username, onLogout }) {
   const [content, setContent] = useState('')
   const [source, setSource] = useState('')
   const [note, setNote] = useState('')
@@ -12,23 +17,126 @@ function App() {
   const [similarEntries, setSimilarEntries] = useState([])
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState('')
+  const [deviceId, setDeviceId] = useState('')
+  const [syncStatus, setSyncStatus] = useState('idle')
+  const [lastSyncTime, setLastSyncTime] = useState(null)
+  const [isOnline, setIsOnline] = useState(navigator.onLine)
+  const navigate = useNavigate()
 
-  // 加载所有条目
+  const api = axios.create({
+    baseURL: API_BASE,
+    headers: {
+      Authorization: `Bearer ${localStorage.getItem(TOKEN_KEY)}`,
+    },
+  })
+
+  const getDeviceId = () => {
+    let id = localStorage.getItem(DEVICE_ID_KEY)
+    if (!id) {
+      id = 'device_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9)
+      localStorage.setItem(DEVICE_ID_KEY, id)
+    }
+    return id
+  }
+
+  const saveLocalData = (data) => {
+    localStorage.setItem(LOCAL_DATA_KEY, JSON.stringify(data))
+  }
+
+  const loadLocalData = () => {
+    const data = localStorage.getItem(LOCAL_DATA_KEY)
+    return data ? JSON.parse(data) : []
+  }
+
+  const syncData = async () => {
+    if (!isOnline) {
+      setSyncStatus('offline')
+      return
+    }
+
+    try {
+      setSyncStatus('syncing')
+      const localEntries = loadLocalData()
+      
+      const response = await api.post('/sync', {
+        device_id: deviceId,
+        local_entries: localEntries
+      })
+
+      const { server_entries, conflicts, last_sync_time } = response.data
+
+      if (conflicts.length > 0) {
+        setMessage(`发现 ${conflicts.length} 个冲突，请手动处理`)
+        setSyncStatus('conflict')
+      } else {
+        setSyncStatus('synced')
+        localStorage.setItem(LAST_SYNC_KEY, last_sync_time)
+        setLastSyncTime(last_sync_time)
+      }
+
+      const allEntries = [...server_entries]
+      const localIds = new Set(localEntries.map(e => e.id))
+      server_entries.forEach(se => {
+        localIds.delete(se.id)
+      })
+      localEntries.filter(e => localIds.has(e.id) && !e.deleted).forEach(le => {
+        allEntries.push(le)
+      })
+
+      setEntries(allEntries.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)))
+      saveLocalData([])
+
+      if (conflicts.length === 0) {
+        setMessage('同步完成')
+      }
+    } catch (error) {
+      console.error('Sync error:', error)
+      setSyncStatus('error')
+      setMessage('同步失败: ' + (error.response?.data?.detail || error.message))
+    }
+  }
+
   const loadEntries = async () => {
     try {
-      const response = await axios.get(`${API_BASE}/entries`)
+      const response = await api.get('/entries')
       setEntries(response.data)
+      saveLocalData([])
     } catch (error) {
       console.error('Error loading entries:', error)
       setMessage('加载条目失败')
+      setSyncStatus('offline')
     }
   }
 
   useEffect(() => {
+    const id = getDeviceId()
+    setDeviceId(id)
+    const lastSync = localStorage.getItem(LAST_SYNC_KEY)
+    setLastSyncTime(lastSync)
     loadEntries()
+    
+    const syncInterval = setInterval(() => {
+      if (isOnline) {
+        syncData()
+      }
+    }, 30000)
+
+    return () => clearInterval(syncInterval)
   }, [])
 
-  // 保存新条目
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true)
+    const handleOffline = () => setIsOnline(false)
+
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+
+    return () => {
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
+    }
+  }, [])
+
   const handleSubmit = async (e) => {
     e.preventDefault()
     
@@ -41,7 +149,7 @@ function App() {
     setMessage('正在分析...')
 
     try {
-      const response = await axios.post(`${API_BASE}/entries`, {
+      const response = await api.post('/entries', {
         content: content.trim(),
         source: source.trim() || null,
         note: note.trim() || null
@@ -52,32 +160,52 @@ function App() {
       setSource('')
       setNote('')
       
-      // 重新加载列表
       await loadEntries()
       
-      // 显示新添加的条目
       setSelectedEntry(response.data)
       setSimilarEntries([])
+      await syncData()
       
     } catch (error) {
-      console.error('Error creating entry:', error)
-      setMessage('保存失败: ' + (error.response?.data?.detail || error.message))
+      if (!isOnline) {
+        const localEntries = loadLocalData()
+        const newEntry = {
+          id: Date.now(),
+          content: content.trim(),
+          source: source.trim() || null,
+          note: note.trim() || null,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          deleted: 0,
+          device_id: deviceId,
+          sync_status: 'pending',
+          version: 1,
+          entry_type: 'word',
+          ai_analysis: '{}',
+          tags: ''
+        }
+        localEntries.push(newEntry)
+        saveLocalData(localEntries)
+        setEntries([newEntry, ...entries])
+        setMessage('已保存到本地，离线状态下将同步到服务器')
+      } else {
+        console.error('Error creating entry:', error)
+        setMessage('保存失败: ' + (error.response?.data?.detail || error.message))
+      }
     } finally {
       setLoading(false)
     }
   }
 
-  // 查看条目详情
   const handleViewEntry = async (entry) => {
     setSelectedEntry(entry)
     setSimilarEntries([])
   }
 
-  // 查找相似条目
   const handleFindSimilar = async (entryId) => {
     setLoading(true)
     try {
-      const response = await axios.get(`${API_BASE}/entries/${entryId}/similar`)
+      const response = await api.get(`/entries/${entryId}/similar`)
       setSimilarEntries(response.data)
       setMessage(`找到 ${response.data.length} 个相似条目`)
     } catch (error) {
@@ -88,231 +216,479 @@ function App() {
     }
   }
 
-  // 删除条目
   const handleDelete = async (entryId) => {
     if (!confirm('确定要删除这条记录吗？')) return
     
     try {
-      await axios.delete(`${API_BASE}/entries/${entryId}`)
+      await api.delete(`/entries/${entryId}`)
       setMessage('删除成功')
       await loadEntries()
+      await syncData()
       if (selectedEntry?.id === entryId) {
         setSelectedEntry(null)
         setSimilarEntries([])
       }
     } catch (error) {
-      console.error('Error deleting entry:', error)
-      setMessage('删除失败')
+      if (!isOnline) {
+        const localEntries = loadLocalData()
+        const entryIndex = entries.findIndex(e => e.id === entryId)
+        if (entryIndex !== -1) {
+          const entry = { ...entries[entryIndex], deleted: 1, updated_at: new Date().toISOString() }
+          localEntries.push(entry)
+          saveLocalData(localEntries)
+          setEntries(entries.filter(e => e.id !== entryId))
+          setMessage('已标记删除，离线状态下将同步到服务器')
+        }
+        if (selectedEntry?.id === entryId) {
+          setSelectedEntry(null)
+          setSimilarEntries([])
+        }
+      } else {
+        console.error('Error deleting entry:', error)
+        setMessage('删除失败')
+      }
     }
   }
 
-  // 渲染 AI 分析结果
   const renderAnalysis = (entry) => {
     try {
       const analysis = JSON.parse(entry.ai_analysis)
       
       if (entry.entry_type === 'word') {
         return (
-          <div className="analysis">
-            <h3>📚 单词分析</h3>
-            <div className="analysis-item">
-              <strong>单词:</strong> {analysis.word}
-            </div>
-            <div className="analysis-item">
-              <strong>词性:</strong> {analysis.part_of_speech}
-            </div>
-            <div className="analysis-item">
-              <strong>释义:</strong> {analysis.definition}
-            </div>
-            <div className="analysis-item">
-              <strong>常见搭配:</strong>
-              <ul>
-                {analysis.collocations?.map((col, idx) => (
-                  <li key={idx}>{col}</li>
-                ))}
-              </ul>
-            </div>
-            <div className="analysis-item">
-              <strong>例句:</strong> {analysis.example_sentence}
+          <div className="bg-yellow-50 border-l-4 border-yellow-500 rounded-lg p-4">
+            <h3 className="text-lg font-semibold text-yellow-800 mb-3">📚 单词分析</h3>
+            <div className="space-y-2">
+              <div>
+                <span className="font-semibold text-gray-700">单词:</span> {analysis.word}
+              </div>
+              <div>
+                <span className="font-semibold text-gray-700">词性:</span> {analysis.part_of_speech}
+              </div>
+              <div>
+                <span className="font-semibold text-gray-700">释义:</span> {analysis.definition}
+              </div>
+              <div>
+                <span className="font-semibold text-gray-700">常见搭配:</span>
+                <ul className="list-disc list-inside ml-2 mt-1">
+                  {analysis.collocations?.map((col, idx) => (
+                    <li key={idx}>{col}</li>
+                  ))}
+                </ul>
+              </div>
+              <div>
+                <span className="font-semibold text-gray-700">例句:</span> {analysis.example_sentence}
+              </div>
             </div>
           </div>
         )
       } else {
         return (
-          <div className="analysis">
-            <h3>✍️ 句子分析</h3>
-            <div className="analysis-item">
-              <strong>句子功能:</strong> {analysis.function}
-            </div>
-            <div className="analysis-item">
-              <strong>句式模式:</strong> {analysis.pattern}
-            </div>
-            <div className="analysis-item">
-              <strong>为什么是好句子:</strong> {analysis.why_good}
-            </div>
-            <div className="analysis-item">
-              <strong>改写示例:</strong>
-              <ul>
-                {analysis.rewrite_examples?.map((example, idx) => (
-                  <li key={idx}>{example}</li>
-                ))}
-              </ul>
+          <div className="bg-yellow-50 border-l-4 border-yellow-500 rounded-lg p-4">
+            <h3 className="text-lg font-semibold text-yellow-800 mb-3">✍️ 句子分析</h3>
+            <div className="space-y-2">
+              <div>
+                <span className="font-semibold text-gray-700">句子功能:</span> {analysis.function}
+              </div>
+              <div>
+                <span className="font-semibold text-gray-700">句式模式:</span> {analysis.pattern}
+              </div>
+              <div>
+                <span className="font-semibold text-gray-700">为什么是好句子:</span> {analysis.why_good}
+              </div>
+              <div>
+                <span className="font-semibold text-gray-700">改写示例:</span>
+                <ul className="list-disc list-inside ml-2 mt-1">
+                  {analysis.rewrite_examples?.map((example, idx) => (
+                    <li key={idx}>{example}</li>
+                  ))}
+                </ul>
+              </div>
             </div>
           </div>
         )
       }
     } catch (error) {
-      return <div className="analysis">分析结果解析失败</div>
+      return <div className="text-red-600">分析结果解析失败</div>
     }
   }
 
   return (
-    <div className="app">
-      <header>
-        <h1>📖 English Study Tool</h1>
-        <p>记录和复习英语单词与句子</p>
-      </header>
-
-      <div className="container">
-        {/* 输入区域 */}
-        <div className="input-section">
-          <h2>添加新内容</h2>
-          <form onSubmit={handleSubmit}>
-            <div className="form-group">
-              <label>英文单词或句子 *</label>
-              <textarea
-                value={content}
-                onChange={(e) => setContent(e.target.value)}
-                placeholder="粘贴一个单词或完整的句子..."
-                rows="4"
-                disabled={loading}
-              />
-            </div>
-            
-            <div className="form-row">
-              <div className="form-group">
-                <label>来源</label>
-                <input
-                  type="text"
-                  value={source}
-                  onChange={(e) => setSource(e.target.value)}
-                  placeholder="例如: X, YouTube, Report"
-                  disabled={loading}
-                />
-              </div>
-              
-              <div className="form-group">
-                <label>备注</label>
-                <input
-                  type="text"
-                  value={note}
-                  onChange={(e) => setNote(e.target.value)}
-                  placeholder="为什么喜欢这句话?"
-                  disabled={loading}
-                />
-              </div>
-            </div>
-
-            <button type="submit" disabled={loading} className="btn-primary">
-              {loading ? '处理中...' : '💾 保存'}
-            </button>
-          </form>
-
-          {message && <div className="message">{message}</div>}
-        </div>
-
-        {/* 历史记录区域 */}
-        <div className="history-section">
-          <h2>📚 历史记录 ({entries.length})</h2>
-          <div className="entries-list">
-            {entries.map((entry) => (
-              <div 
-                key={entry.id} 
-                className={`entry-card ${selectedEntry?.id === entry.id ? 'selected' : ''}`}
-                onClick={() => handleViewEntry(entry)}
+    <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-pink-50">
+      <nav className="bg-white shadow-md">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between items-center h-16">
+            <div className="flex items-center space-x-4">
+              <Link to="/" className="text-xl font-bold text-indigo-600 hover:text-indigo-800">
+                📖 English Study Tool
+              </Link>
+              <Link
+                to="/"
+                className="text-gray-700 hover:text-indigo-600 px-3 py-2 rounded-md text-sm font-medium transition"
               >
-                <div className="entry-header">
-                  <span className="entry-type">{entry.entry_type === 'word' ? '📝 单词' : '✍️ 句子'}</span>
-                  <span className="entry-date">{new Date(entry.created_at).toLocaleDateString()}</span>
-                </div>
-                <div className="entry-content">{entry.content}</div>
-                {entry.tags && (
-                  <div className="entry-tags">
-                    {entry.tags.split(',').map((tag, idx) => (
-                      <span key={idx} className="tag">{tag}</span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
+                学习
+              </Link>
+              <Link
+                to="/charts"
+                className="text-gray-700 hover:text-indigo-600 px-3 py-2 rounded-md text-sm font-medium transition"
+              >
+                图表
+              </Link>
+            </div>
+            <div className="flex items-center space-x-4">
+              <span className={`text-sm ${isOnline ? 'text-green-600' : 'text-red-600'}`}>
+                {isOnline ? '🟢 在线' : '🔴 离线'}
+              </span>
+              <span className="text-sm text-gray-700">
+                欢迎, {username}
+              </span>
+              <button
+                onClick={onLogout}
+                className="bg-red-500 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-red-600 transition"
+              >
+                退出
+              </button>
+            </div>
           </div>
         </div>
+      </nav>
 
-        {/* 详情区域 */}
-        {selectedEntry && (
-          <div className="detail-section">
-            <div className="detail-header">
-              <h2>详细信息</h2>
-              <div className="detail-actions">
-                <button 
-                  onClick={() => handleFindSimilar(selectedEntry.id)}
-                  className="btn-secondary"
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="space-y-6">
+            <div className="bg-white rounded-xl shadow-lg p-6">
+              <h2 className="text-xl font-bold text-gray-800 mb-4">添加新内容</h2>
+              <form onSubmit={handleSubmit} className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    英文单词或句子 *
+                  </label>
+                  <textarea
+                    value={content}
+                    onChange={(e) => setContent(e.target.value)}
+                    placeholder="粘贴一个单词或完整的句子..."
+                    rows="4"
+                    disabled={loading}
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition resize-none"
+                  />
+                </div>
+                
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      来源
+                    </label>
+                    <input
+                      type="text"
+                      value={source}
+                      onChange={(e) => setSource(e.target.value)}
+                      placeholder="例如: X, YouTube, Report"
+                      disabled={loading}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition"
+                    />
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      备注
+                    </label>
+                    <input
+                      type="text"
+                      value={note}
+                      onChange={(e) => setNote(e.target.value)}
+                      placeholder="为什么喜欢这句话?"
+                      disabled={loading}
+                      className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
                   disabled={loading}
+                  className="w-full bg-gradient-to-r from-indigo-500 to-purple-600 text-white py-3 rounded-lg font-semibold hover:from-indigo-600 hover:to-purple-700 transition duration-300 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg hover:shadow-xl"
                 >
-                  🔍 查找相似
+                  {loading ? '处理中...' : '💾 保存'}
                 </button>
-                <button 
-                  onClick={() => handleDelete(selectedEntry.id)}
-                  className="btn-danger"
-                >
-                  🗑️ 删除
-                </button>
-              </div>
-            </div>
+              </form>
 
-            <div className="detail-content">
-              <div className="detail-original">
-                <h3>原文</h3>
-                <p className="original-text">{selectedEntry.content}</p>
-                {selectedEntry.source && (
-                  <p className="meta"><strong>来源:</strong> {selectedEntry.source}</p>
-                )}
-                {selectedEntry.note && (
-                  <p className="meta"><strong>备注:</strong> {selectedEntry.note}</p>
-                )}
-              </div>
-
-              {renderAnalysis(selectedEntry)}
-
-              {/* 相似条目 */}
-              {similarEntries.length > 0 && (
-                <div className="similar-section">
-                  <h3>🔗 相似内容</h3>
-                  {similarEntries.map((similar) => (
-                    <div 
-                      key={similar.id} 
-                      className="similar-card"
-                      onClick={() => handleViewEntry(similar)}
-                    >
-                      <div className="similar-header">
-                        <span className="entry-type">
-                          {similar.entry_type === 'word' ? '📝 单词' : '✍️ 句子'}
-                        </span>
-                        <span className="similarity-score">
-                          相似度: {(similar.similarity * 100).toFixed(1)}%
-                        </span>
-                      </div>
-                      <div className="similar-content">{similar.content}</div>
-                    </div>
-                  ))}
+              {message && (
+                <div className="mt-4 p-4 bg-blue-50 border-l-4 border-blue-500 rounded-lg">
+                  <p className="text-sm text-blue-700">{message}</p>
                 </div>
               )}
             </div>
+
+            <div className="bg-white rounded-xl shadow-lg p-6">
+              <h2 className="text-xl font-bold text-gray-800 mb-4">
+                📚 历史记录 ({entries.length})
+              </h2>
+              <div className="max-h-96 overflow-y-auto space-y-3">
+                {entries.map((entry) => (
+                  <div 
+                    key={entry.id} 
+                    className={`p-4 border-2 rounded-lg cursor-pointer transition hover:shadow-md ${
+                      selectedEntry?.id === entry.id 
+                        ? 'border-indigo-500 bg-indigo-50' 
+                        : 'border-gray-200 hover:border-indigo-300'
+                    }`}
+                    onClick={() => handleViewEntry(entry)}
+                  >
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="text-sm font-semibold text-indigo-600">
+                        {entry.entry_type === 'word' ? '📝 单词' : '✍️ 句子'}
+                      </span>
+                      <span className="text-xs text-gray-500">
+                        {new Date(entry.created_at).toLocaleDateString()}
+                      </span>
+                    </div>
+                    <div className="text-gray-800">{entry.content}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
-        )}
+
+          {selectedEntry && (
+            <div className="bg-white rounded-xl shadow-lg p-6">
+              <div className="flex justify-between items-center mb-4 pb-4 border-b-2 border-gray-200">
+                <h2 className="text-xl font-bold text-gray-800">详细信息</h2>
+                <div className="flex gap-2">
+                  <button 
+                    onClick={() => handleFindSimilar(selectedEntry.id)}
+                    className="bg-green-500 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-green-600 transition"
+                    disabled={loading}
+                  >
+                    🔍 查找相似
+                  </button>
+                  <button 
+                    onClick={() => handleDelete(selectedEntry.id)}
+                    className="bg-red-500 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-red-600 transition"
+                  >
+                    🗑️ 删除
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div className="bg-gray-50 rounded-lg p-4 border-l-4 border-indigo-500">
+                  <h3 className="text-lg font-semibold text-indigo-800 mb-2">原文</h3>
+                  <p className="text-lg text-gray-800 mb-2">{selectedEntry.content}</p>
+                  {selectedEntry.source && (
+                    <p className="text-sm text-gray-600">
+                      <strong>来源:</strong> {selectedEntry.source}
+                    </p>
+                  )}
+                  {selectedEntry.note && (
+                    <p className="text-sm text-gray-600">
+                      <strong>备注:</strong> {selectedEntry.note}
+                    </p>
+                  )}
+                </div>
+
+                {renderAnalysis(selectedEntry)}
+
+                {similarEntries.length > 0 && (
+                  <div className="bg-green-50 border-l-4 border-green-500 rounded-lg p-4">
+                    <h3 className="text-lg font-semibold text-green-800 mb-3">🔗 相似内容</h3>
+                    <div className="space-y-2">
+                      {similarEntries.map((similar) => (
+                        <div 
+                          key={similar.id} 
+                          className="bg-white p-3 rounded-lg cursor-pointer hover:shadow-md transition"
+                          onClick={() => handleViewEntry(similar)}
+                        >
+                          <div className="flex justify-between items-center mb-1">
+                            <span className="text-xs font-semibold text-indigo-600">
+                              {similar.entry_type === 'word' ? '📝 单词' : '✍️ 句子'}
+                            </span>
+                            <span className="text-xs text-green-600 font-semibold">
+                              相似度: {(similar.similarity * 100).toFixed(1)}%
+                            </span>
+                          </div>
+                          <div className="text-sm text-gray-800">{similar.content}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )
 }
 
-export default App
+export default function App() {
+  const [user, setUser] = useState(null)
+
+  useEffect(() => {
+    const token = localStorage.getItem(TOKEN_KEY)
+    const username = localStorage.getItem('username')
+    if (token && username) {
+      setUser(username)
+    }
+  }, [])
+
+  const handleLogin = (username) => {
+    setUser(username)
+  }
+
+  const handleLogout = () => {
+    localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem('username')
+    setUser(null)
+  }
+
+  return (
+    <Router>
+      {user ? (
+        <Routes>
+          <Route
+            path="/"
+            element={<EnglishStudyApp username={user} onLogout={handleLogout} />}
+          />
+          <Route
+            path="/charts"
+            element={<Charts onLogout={handleLogout} username={user} />}
+          />
+        </Routes>
+      ) : (
+        <Routes>
+          <Route path="*" element={<Login onLogin={handleLogin} />} />
+        </Routes>
+      )}
+    </Router>
+  )
+}
+
+function Charts({ username, onLogout }) {
+  const [chartData, setChartData] = useState([])
+  const chartContainerRef = useRef()
+
+  useEffect(() => {
+    if (!chartContainerRef.current) return
+
+    const chart = createChart(chartContainerRef.current, {
+      layout: {
+        background: { color: 'transparent' },
+        textColor: '#333',
+      },
+      grid: {
+        vertLines: { color: '#e0e0e0' },
+        horzLines: { color: '#e0e0e0' },
+      },
+      width: chartContainerRef.current.clientWidth,
+      height: 400,
+    })
+
+    const candlestickSeries = chart.addCandlestickSeries({
+      upColor: '#26a69a',
+      downColor: '#ef5350',
+      borderVisible: false,
+      wickUpColor: '#26a69a',
+      wickDownColor: '#ef5350',
+    })
+
+    const data = [
+      { time: '2018-12-22', open: 75.16, high: 82.84, low: 36.16, close: 45.72 },
+      { time: '2018-12-23', open: 45.12, high: 53.90, low: 45.12, close: 48.09 },
+      { time: '2018-12-24', open: 60.71, high: 60.71, low: 53.39, close: 59.29 },
+      { time: '2018-12-25', open: 68.26, high: 68.26, low: 59.04, close: 60.50 },
+      { time: '2018-12-26', open: 67.71, high: 105.85, low: 66.67, close: 91.04 },
+      { time: '2018-12-27', open: 91.04, high: 121.40, low: 82.70, close: 111.40 },
+      { time: '2018-12-28', open: 111.51, high: 142.83, low: 103.34, close: 131.25 },
+      { time: '2018-12-29', open: 131.33, high: 151.17, low: 77.68, close: 96.43 },
+      { time: '2018-12-30', open: 106.33, high: 110.20, low: 90.39, close: 98.10 },
+      { time: '2018-12-31', open: 109.87, high: 114.69, low: 85.66, close: 111.26 },
+    ]
+
+    candlestickSeries.setData(data)
+
+    const handleResize = () => {
+      if (chartContainerRef.current) {
+        chart.applyOptions({ width: chartContainerRef.current.clientWidth })
+      }
+    }
+
+    window.addEventListener('resize', handleResize)
+
+    return () => {
+      window.removeEventListener('resize', handleResize)
+      chart.remove()
+    }
+  }, [])
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-pink-50">
+      <nav className="bg-white shadow-md">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between items-center h-16">
+            <div className="flex items-center space-x-4">
+              <Link to="/" className="text-xl font-bold text-indigo-600 hover:text-indigo-800">
+                📖 English Study Tool
+              </Link>
+              <Link
+                to="/"
+                className="text-gray-700 hover:text-indigo-600 px-3 py-2 rounded-md text-sm font-medium transition"
+              >
+                学习
+              </Link>
+              <Link
+                to="/charts"
+                className="text-indigo-600 bg-indigo-50 px-3 py-2 rounded-md text-sm font-medium transition"
+              >
+                图表
+              </Link>
+            </div>
+            <div className="flex items-center space-x-4">
+              <span className="text-sm text-gray-700">
+                欢迎, {username}
+              </span>
+              <button
+                onClick={onLogout}
+                className="bg-red-500 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-red-600 transition"
+              >
+                退出
+              </button>
+            </div>
+          </div>
+        </div>
+      </nav>
+
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="bg-white rounded-xl shadow-lg p-6">
+          <div className="mb-6">
+            <h2 className="text-2xl font-bold text-gray-800 mb-2">📊 K线图表</h2>
+            <p className="text-gray-600">
+              基于 TradingView Lightweight Charts 的金融图表示例
+            </p>
+          </div>
+
+          <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
+            <div ref={chartContainerRef} />
+          </div>
+
+          <div className="mt-6 p-4 bg-blue-50 rounded-lg border border-blue-200">
+            <h3 className="font-semibold text-blue-800 mb-2">ℹ️ 功能说明</h3>
+            <ul className="text-sm text-blue-700 space-y-1">
+              <li>• 交互式图表：支持鼠标滚轮缩放</li>
+              <li>• 拖拽浏览：按住鼠标拖动查看历史数据</li>
+              <li>• 悬停详情：鼠标悬停显示详细信息</li>
+              <li>• 响应式设计：自适应屏幕尺寸</li>
+            </ul>
+          </div>
+
+          <div className="mt-6 p-4 bg-amber-50 rounded-lg border border-amber-200">
+            <p className="text-sm text-amber-700">
+              <span className="font-semibold">注意：</span>
+              此图表使用 TradingView Lightweight Charts 库渲染，数据为示例数据。
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
